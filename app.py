@@ -83,6 +83,27 @@ def init_db():
                 ON messages (line_message_id) WHERE line_message_id IS NOT NULL
                 """
             )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS conversation_meta (
+                    user_id TEXT PRIMARY KEY,
+                    assigned_to TEXT,
+                    updated_at DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notes (
+                    id SERIAL PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    author TEXT,
+                    text TEXT,
+                    media_id INTEGER REFERENCES media(id),
+                    created_at DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
     finally:
         get_pool().putconn(conn)
 
@@ -90,6 +111,17 @@ def init_db():
 @app.on_event("startup")
 def on_startup():
     init_db()
+
+
+# Mock sales team for the "assign conversation" demo feature. In a real
+# system this would come from a users/accounts table with real login.
+SALES_TEAM = [
+    {"id": "sales1", "name": "คุณเอ - โครงการ A", "color": "#F44336"},
+    {"id": "sales2", "name": "คุณบี - โครงการ B", "color": "#2196F3"},
+    {"id": "sales3", "name": "คุณซี - โครงการ C", "color": "#FF9800"},
+    {"id": "sales4", "name": "คุณดี - โครงการ D", "color": "#4CAF50"},
+    {"id": "sales5", "name": "คุณอี - โครงการ E", "color": "#9C27B0"},
+]
 
 
 def verify_signature(body: bytes, signature: str) -> bool:
@@ -209,6 +241,11 @@ def healthz():
     return {"status": "ok"}
 
 
+@app.get("/api/sales-team")
+def get_sales_team():
+    return SALES_TEAM
+
+
 @app.post("/webhook")
 async def line_webhook(request: Request):
     body = await request.body()
@@ -282,9 +319,10 @@ def list_conversations():
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT user_id, MAX(created_at) as last_at
-                FROM messages
-                GROUP BY user_id
+                SELECT m.user_id, MAX(m.created_at) as last_at, cm.assigned_to
+                FROM messages m
+                LEFT JOIN conversation_meta cm ON cm.user_id = m.user_id
+                GROUP BY m.user_id, cm.assigned_to
                 ORDER BY last_at DESC
                 """
             )
@@ -299,9 +337,30 @@ def list_conversations():
                 "user_id": r["user_id"],
                 "display_name": get_known_display_name(r["user_id"]),
                 "last_at": r["last_at"],
+                "assigned_to": r["assigned_to"],
             }
         )
     return result
+
+
+@app.post("/api/conversations/{user_id}/assign")
+async def assign_conversation(user_id: str, request: Request):
+    body = await request.json()
+    assigned_to = body.get("assigned_to")  # a SALES_TEAM id, or null to unassign
+    conn = get_pool().getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO conversation_meta (user_id, assigned_to, updated_at)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET assigned_to = EXCLUDED.assigned_to, updated_at = EXCLUDED.updated_at
+                """,
+                (user_id, assigned_to, time.time()),
+            )
+    finally:
+        get_pool().putconn(conn)
+    return {"status": "ok", "assigned_to": assigned_to}
 
 
 @app.get("/api/conversations/{user_id}/messages")
@@ -319,6 +378,66 @@ def get_messages(user_id: str):
             return [dict(r) for r in cur.fetchall()]
     finally:
         get_pool().putconn(conn)
+
+
+@app.get("/api/conversations/{user_id}/notes")
+def get_notes(user_id: str):
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT id, author, text, media_id, created_at
+                FROM notes WHERE user_id = %s ORDER BY created_at ASC
+                """,
+                (user_id,),
+            )
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        get_pool().putconn(conn)
+
+
+@app.post("/api/conversations/{user_id}/notes")
+async def add_note(user_id: str, request: Request):
+    body = await request.json()
+    author = (body.get("author") or "").strip() or "ไม่ระบุ"
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    conn = get_pool().getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO notes (user_id, author, text, created_at) VALUES (%s, %s, %s, %s)",
+                (user_id, author, text, time.time()),
+            )
+    finally:
+        get_pool().putconn(conn)
+    return {"status": "ok"}
+
+
+@app.post("/api/conversations/{user_id}/notes-media")
+async def add_note_with_media(
+    user_id: str,
+    author: str = Form("ไม่ระบุ"),
+    text: str = Form(""),
+    file: UploadFile = File(...),
+):
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+    content_type = file.content_type or "application/octet-stream"
+    media_id = save_media(content_type, file.filename, data)
+    conn = get_pool().getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO notes (user_id, author, text, media_id, created_at) VALUES (%s, %s, %s, %s, %s)",
+                (user_id, author.strip() or "ไม่ระบุ", text.strip(), media_id, time.time()),
+            )
+    finally:
+        get_pool().putconn(conn)
+    return {"status": "ok", "media_id": media_id}
 
 
 @app.post("/api/conversations/{user_id}/reply")
