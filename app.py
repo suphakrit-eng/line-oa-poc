@@ -65,8 +65,22 @@ def init_db():
                     msg_type TEXT NOT NULL DEFAULT 'text',
                     text TEXT,
                     media_id INTEGER REFERENCES media(id),
-                    created_at DOUBLE PRECISION NOT NULL
+                    created_at DOUBLE PRECISION NOT NULL,
+                    line_message_id TEXT
                 )
+                """
+            )
+            # Migration for tables created before line_message_id existed.
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS line_message_id TEXT")
+            # LINE sometimes redelivers the same webhook event (e.g. if our
+            # server was slow to respond, such as waking up from sleep on
+            # Render's free tier). This unique index + ON CONFLICT DO NOTHING
+            # in save_message() makes that safe to ignore instead of creating
+            # duplicate messages.
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_line_message_id
+                ON messages (line_message_id) WHERE line_message_id IS NOT NULL
                 """
             )
     finally:
@@ -145,17 +159,29 @@ def save_message(
     msg_type: str = "text",
     text: str | None = None,
     media_id: int | None = None,
+    line_message_id: str | None = None,
 ):
     conn = get_pool().getconn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO messages (user_id, display_name, direction, msg_type, text, media_id, created_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO messages (user_id, display_name, direction, msg_type, text, media_id, created_at, line_message_id)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (line_message_id) WHERE line_message_id IS NOT NULL DO NOTHING
                 """,
-                (user_id, display_name, direction, msg_type, text, media_id, time.time()),
+                (user_id, display_name, direction, msg_type, text, media_id, time.time(), line_message_id),
             )
+    finally:
+        get_pool().putconn(conn)
+
+
+def is_duplicate_line_message(line_message_id: str) -> bool:
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM messages WHERE line_message_id = %s LIMIT 1", (line_message_id,))
+            return cur.fetchone() is not None
     finally:
         get_pool().putconn(conn)
 
@@ -201,10 +227,21 @@ async def line_webhook(request: Request):
         message = event.get("message", {})
         msg_type = message.get("type")
         user_id = event["source"]["userId"]
+        line_message_id = message.get("id")
+
+        # LINE may redeliver the same webhook event (e.g. our server was slow
+        # to wake up from Render's free-tier sleep and LINE timed out waiting
+        # for a response, then retried). Skip anything we've already stored.
+        if line_message_id and is_duplicate_line_message(line_message_id):
+            continue
+
         display_name = await fetch_display_name(user_id)
 
         if msg_type == "text":
-            save_message(user_id, display_name, "in", "text", text=message.get("text", ""))
+            save_message(
+                user_id, display_name, "in", "text",
+                text=message.get("text", ""), line_message_id=line_message_id,
+            )
 
         elif msg_type in ("image", "file", "video", "audio"):
             try:
@@ -213,6 +250,7 @@ async def line_webhook(request: Request):
                 save_message(
                     user_id, display_name, "in", "text",
                     text=f"[ไม่สามารถดาวน์โหลด {msg_type} จากลูกค้าได้]",
+                    line_message_id=line_message_id,
                 )
                 continue
 
@@ -224,13 +262,14 @@ async def line_webhook(request: Request):
             media_id = save_media(content_type, filename, data)
             save_message(
                 user_id, display_name, "in", stored_type,
-                text=filename, media_id=media_id,
+                text=filename, media_id=media_id, line_message_id=line_message_id,
             )
 
         else:
             save_message(
                 user_id, display_name, "in", "text",
                 text=f"[ลูกค้าส่ง {msg_type} มา — ยังไม่รองรับการแสดงผลประเภทนี้]",
+                line_message_id=line_message_id,
             )
 
     return JSONResponse({"status": "ok"})
