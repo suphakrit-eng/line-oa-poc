@@ -2,32 +2,46 @@
 <html lang="th">
 <head>
 <meta charset="UTF-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
 <title>LINE OA External Chat POC</title>
 <style>
   * { box-sizing: border-box; font-family: -apple-system, "Segoe UI", Tahoma, sans-serif; }
-  body { margin: 0; display: flex; height: 100vh; background: #f4f4f4; }
+  html, body { margin: 0; height: 100%; background: #f4f4f4; }
+  body { display: flex; height: 100dvh; overflow: hidden; }
   #sidebar { width: 280px; background: #fff; border-right: 1px solid #ddd; overflow-y: auto; flex-shrink: 0; }
   #sidebar h2 { font-size: 15px; padding: 16px; margin: 0; border-bottom: 1px solid #eee; }
-  .conv-item { padding: 12px 16px; cursor: pointer; border-bottom: 1px solid #f0f0f0; }
+  .conv-item { padding: 14px 16px; cursor: pointer; border-bottom: 1px solid #f0f0f0; }
   .conv-item:hover, .conv-item.active { background: #e8f5e9; }
   .conv-item .name { font-weight: 600; font-size: 14px; }
   .conv-item .time { font-size: 11px; color: #888; margin-top: 2px; }
   #empty-list { padding: 16px; color: #999; font-size: 13px; }
-  #chat { flex: 1; display: flex; flex-direction: column; }
-  #chat-header { padding: 14px 20px; background: #06c755; color: #fff; font-weight: 600; }
-  #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
-  .bubble { max-width: 60%; padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.4; word-wrap: break-word; }
+  #chat { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #chat-header { padding: 14px 20px; background: #06c755; color: #fff; font-weight: 600; display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+  #back-btn { display: none; background: none; border: none; color: #fff; font-size: 20px; cursor: pointer; padding: 0 4px 0 0; line-height: 1; }
+  #messages { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .bubble { max-width: 75%; padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.4; word-wrap: break-word; }
   .bubble.in { background: #fff; align-self: flex-start; border: 1px solid #eee; }
   .bubble.out { background: #06c755; color: #fff; align-self: flex-end; }
   .bubble.media { padding: 6px; }
   .bubble.media img { max-width: 220px; max-height: 220px; border-radius: 8px; display: block; cursor: pointer; }
   .bubble.media a { color: inherit; text-decoration: underline; }
-  #input-row { display: flex; align-items: center; padding: 12px; border-top: 1px solid #ddd; background: #fff; }
-  #input-row input[type="text"] { flex: 1; padding: 10px 14px; border: 1px solid #ccc; border-radius: 20px; font-size: 14px; }
-  #input-row button { margin-left: 8px; padding: 10px 18px; background: #06c755; color: #fff; border: none; border-radius: 20px; cursor: pointer; }
-  #attach-btn { margin-right: 8px; padding: 10px 14px; background: #eee; color: #333; border: none; border-radius: 20px; cursor: pointer; font-size: 16px; }
-  #placeholder { margin: auto; color: #999; }
+  #input-row { display: flex; align-items: center; padding: 10px; border-top: 1px solid #ddd; background: #fff; flex-shrink: 0; padding-bottom: max(10px, env(safe-area-inset-bottom)); }
+  #input-row input[type="text"] { flex: 1; min-width: 0; padding: 10px 14px; border: 1px solid #ccc; border-radius: 20px; font-size: 16px; }
+  #input-row button { margin-left: 8px; padding: 10px 18px; background: #06c755; color: #fff; border: none; border-radius: 20px; cursor: pointer; flex-shrink: 0; }
+  #attach-btn { margin-right: 8px; padding: 10px 14px; background: #eee; color: #333; border: none; border-radius: 20px; cursor: pointer; font-size: 16px; flex-shrink: 0; }
+  #placeholder { margin: auto; color: #999; padding: 16px; text-align: center; }
+
+  /* Mobile layout: show either the conversation list or the chat, not both */
+  @media (max-width: 768px) {
+    body { position: relative; }
+    #sidebar { width: 100%; border-right: none; }
+    #chat { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: #f4f4f4; transform: translateX(100%); transition: transform 0.2s ease; z-index: 10; }
+    #back-btn { display: inline-block; }
+    body.chat-open #sidebar { display: none; }
+    body.chat-open #chat { transform: translateX(0); }
+    .bubble { max-width: 85%; }
+    #chat-header { padding-top: max(14px, env(safe-area-inset-top)); }
+  }
 </style>
 </head>
 <body>
@@ -66,11 +80,19 @@ function selectConversation(userId, name) {
   renderChatFrame(name || userId);
   loadMessages();
   loadConversations();
+  document.body.classList.add('chat-open');
+}
+
+function goBackToList() {
+  document.body.classList.remove('chat-open');
 }
 
 function renderChatFrame(name) {
   document.getElementById('chat').innerHTML = `
-    <div id="chat-header">${escapeHtml(name)}</div>
+    <div id="chat-header">
+      <button id="back-btn" onclick="goBackToList()">‹</button>
+      <span>${escapeHtml(name)}</span>
+    </div>
     <div id="messages"></div>
     <div id="input-row">
       <button id="attach-btn" title="แนบรูป/ไฟล์">📎</button>
