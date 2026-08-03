@@ -12,5 +12,7 @@ services:
         sync: false
       - key: DATABASE_URL
         sync: false
+      - key: LIFF_ID
+        sync: false
       - key: PYTHON_VERSION
         value: "3.12.7"

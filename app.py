@@ -11,7 +11,7 @@ import psycopg2.extras
 from psycopg2.pool import SimpleConnectionPool
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 
@@ -20,6 +20,7 @@ load_dotenv()
 CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
 CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
+LIFF_ID = os.getenv("LIFF_ID", "")
 
 BASE_DIR = Path(__file__).parent
 
@@ -101,6 +102,20 @@ def init_db():
                     text TEXT,
                     media_id INTEGER REFERENCES media(id),
                     created_at DOUBLE PRECISION NOT NULL
+                )
+                """
+            )
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS customer_profile (
+                    user_id TEXT PRIMARY KEY,
+                    email TEXT,
+                    phone TEXT,
+                    first_name TEXT,
+                    last_name TEXT,
+                    birthday TEXT,
+                    consent_at DOUBLE PRECISION,
+                    updated_at DOUBLE PRECISION NOT NULL
                 )
                 """
             )
@@ -438,6 +453,217 @@ async def add_note_with_media(
     finally:
         get_pool().putconn(conn)
     return {"status": "ok", "media_id": media_id}
+
+
+@app.get("/api/conversations/{user_id}/profile")
+def get_customer_profile(user_id: str):
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT email, phone, first_name, last_name, birthday, consent_at, updated_at
+                FROM customer_profile WHERE user_id = %s
+                """,
+                (user_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else {}
+    finally:
+        get_pool().putconn(conn)
+
+
+@app.post("/api/customer-profile")
+async def save_customer_profile(request: Request):
+    """Called from the /register LIFF form the customer fills in themselves."""
+    body = await request.json()
+    user_id = (body.get("user_id") or "").strip()
+    email = (body.get("email") or "").strip()
+    phone = (body.get("phone") or "").strip()
+    first_name = (body.get("first_name") or "").strip()
+    last_name = (body.get("last_name") or "").strip()
+    birthday = (body.get("birthday") or "").strip()
+
+    if not user_id or not email or not first_name or not last_name:
+        raise HTTPException(status_code=400, detail="user_id, email, first_name, last_name are required")
+
+    now = time.time()
+    conn = get_pool().getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO customer_profile (user_id, email, phone, first_name, last_name, birthday, consent_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    email = EXCLUDED.email,
+                    phone = EXCLUDED.phone,
+                    first_name = EXCLUDED.first_name,
+                    last_name = EXCLUDED.last_name,
+                    birthday = EXCLUDED.birthday,
+                    consent_at = EXCLUDED.consent_at,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (user_id, email, phone or None, first_name, last_name, birthday or None, now, now),
+            )
+    finally:
+        get_pool().putconn(conn)
+    return {"status": "ok"}
+
+
+@app.post("/api/conversations/{user_id}/send-registration-link")
+async def send_registration_link(user_id: str):
+    if not CHANNEL_ACCESS_TOKEN:
+        raise HTTPException(status_code=500, detail="LINE_CHANNEL_ACCESS_TOKEN is not set on the server")
+    if not LIFF_ID:
+        raise HTTPException(status_code=500, detail="LIFF_ID is not set on the server (see README)")
+
+    link = f"https://liff.line.me/{LIFF_ID}"
+    text = f"รบกวนกรอกข้อมูลติดต่อเพิ่มเติมที่ลิงก์นี้ด้วยนะคะ/ครับ 🙏\n{link}"
+    await push_message(user_id, [{"type": "text", "text": text}])
+    save_message(user_id, "", "out", "text", text=text)
+    return {"status": "sent", "url": link}
+
+
+REGISTER_PAGE_HTML = """<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<title>ลงทะเบียนรับข้อมูลเพิ่มเติม</title>
+<script src="https://static.line-scdn.net/liff/edge/2/sdk.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Tahoma, sans-serif; margin: 0; padding: 24px 16px; background: #f4f4f4; }
+  .card { background: #fff; border-radius: 14px; padding: 22px; max-width: 420px; margin: 0 auto; box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+  h1 { font-size: 18px; margin: 0 0 6px; }
+  .sub { font-size: 13px; color: #666; margin-bottom: 4px; }
+  label { display: block; font-size: 13px; margin: 14px 0 4px; color: #333; }
+  input[type=email], input[type=tel], input[type=text], input[type=date] {
+    width: 100%; padding: 10px 12px; border: 1px solid #ccc; border-radius: 8px; font-size: 15px;
+  }
+  .row2 { display: flex; gap: 10px; }
+  .row2 > div { flex: 1; }
+  .consent { display: flex; align-items: flex-start; gap: 8px; margin-top: 18px; font-size: 12px; color: #555; }
+  .consent input { margin-top: 3px; }
+  button { margin-top: 20px; width: 100%; padding: 12px; background: #06c755; color: #fff; border: none; border-radius: 10px; font-size: 15px; cursor: pointer; }
+  button:disabled { background: #ccc; }
+  #status { margin-top: 12px; font-size: 13px; }
+  #status.error { color: #c0392b; }
+  #status.success { color: #06834a; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>ลงทะเบียนรับข้อมูลเพิ่มเติม</h1>
+    <p class="sub">กรอกข้อมูลด้านล่างเพื่อให้ทีมงานติดต่อกลับและส่งข้อมูล/สิทธิพิเศษให้คุณ</p>
+    <form id="reg-form">
+      <div class="row2">
+        <div>
+          <label>ชื่อ *</label>
+          <input type="text" id="first_name" required />
+        </div>
+        <div>
+          <label>นามสกุล *</label>
+          <input type="text" id="last_name" required />
+        </div>
+      </div>
+      <label>อีเมล *</label>
+      <input type="email" id="email" required />
+      <label>เบอร์โทร</label>
+      <input type="tel" id="phone" />
+      <label>วันเกิด</label>
+      <input type="date" id="birthday" />
+      <div class="consent">
+        <input type="checkbox" id="consent" required />
+        <span>ยินยอมให้เก็บและใช้ข้อมูลนี้เพื่อติดต่อกลับ ตามนโยบายความเป็นส่วนตัว (PDPA)</span>
+      </div>
+      <button type="submit" id="submit-btn">ส่งข้อมูล</button>
+    </form>
+    <div id="status"></div>
+  </div>
+
+<script>
+  const LIFF_ID = "__LIFF_ID__";
+  let userId = null;
+  const statusEl = document.getElementById('status');
+  const form = document.getElementById('reg-form');
+  const submitBtn = document.getElementById('submit-btn');
+
+  function setStatus(msg, cls) {
+    statusEl.textContent = msg;
+    statusEl.className = cls || '';
+  }
+
+  async function main() {
+    if (!LIFF_ID) {
+      setStatus('ระบบยังไม่ได้ตั้งค่า LIFF_ID กรุณาติดต่อผู้ดูแลระบบ', 'error');
+      submitBtn.disabled = true;
+      return;
+    }
+    try {
+      await liff.init({ liffId: LIFF_ID });
+      if (!liff.isLoggedIn() && !liff.isInClient()) {
+        liff.login();
+        return;
+      }
+      const profile = await liff.getProfile();
+      userId = profile.userId;
+    } catch (err) {
+      setStatus('ไม่สามารถยืนยันตัวตนผ่าน LINE ได้ กรุณาเปิดลิงก์นี้จากแชท LINE: ' + err.message, 'error');
+      submitBtn.disabled = true;
+    }
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!userId) {
+      setStatus('ยังไม่พร้อมส่งข้อมูล กรุณาเปิดลิงก์นี้จากแชท LINE อีกครั้ง', 'error');
+      return;
+    }
+    submitBtn.disabled = true;
+    setStatus('กำลังส่งข้อมูล...', '');
+
+    const payload = {
+      user_id: userId,
+      first_name: document.getElementById('first_name').value.trim(),
+      last_name: document.getElementById('last_name').value.trim(),
+      email: document.getElementById('email').value.trim(),
+      phone: document.getElementById('phone').value.trim(),
+      birthday: document.getElementById('birthday').value,
+    };
+
+    try {
+      const res = await fetch('/api/customer-profile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) {
+        const err = await res.text();
+        setStatus('เกิดข้อผิดพลาด: ' + err, 'error');
+        submitBtn.disabled = false;
+        return;
+      }
+      setStatus('ส่งข้อมูลเรียบร้อยแล้ว ขอบคุณค่ะ/ครับ', 'success');
+      form.style.display = 'none';
+      setTimeout(() => { if (liff.isInClient && liff.isInClient()) liff.closeWindow(); }, 1500);
+    } catch (err) {
+      setStatus('เกิดข้อผิดพลาด: ' + err.message, 'error');
+      submitBtn.disabled = false;
+    }
+  });
+
+  main();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/register", response_class=HTMLResponse)
+def register_page():
+    return HTMLResponse(content=REGISTER_PAGE_HTML.replace("__LIFF_ID__", LIFF_ID))
 
 
 @app.post("/api/conversations/{user_id}/reply")
