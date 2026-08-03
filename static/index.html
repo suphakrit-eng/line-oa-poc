@@ -11,8 +11,11 @@
 
   #sidebar { width: 300px; background: #fff; border-right: 1px solid #ddd; display: flex; flex-direction: column; flex-shrink: 0; }
   #sidebar h2 { font-size: 15px; padding: 14px 16px 8px; margin: 0; }
-  #identity-bar { padding: 0 16px 10px; display: flex; align-items: center; gap: 8px; font-size: 13px; color: #555; }
+  #identity-bar { padding: 0 16px 10px; display: flex; align-items: center; gap: 6px; font-size: 13px; color: #555; }
   #identity-bar select { flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 8px; font-size: 13px; background: #fafafa; }
+  #current-user-name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #identity-bar button { padding: 6px 10px; border: 1px solid #ddd; background: #fafafa; border-radius: 8px; font-size: 12px; cursor: pointer; flex-shrink: 0; }
+  #identity-bar button:hover { background: #eee; }
   #search-bar { padding: 0 16px 10px; border-bottom: 1px solid #eee; }
   #search-input { width: 100%; padding: 8px 12px; border: 1px solid #ccc; border-radius: 16px; font-size: 14px; }
   #conv-list { flex: 1; overflow-y: auto; }
@@ -41,9 +44,13 @@
   .qr-btn:hover { background: #e8f5e9; }
 
   #messages { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 16px; display: flex; flex-direction: column; gap: 8px; }
+  .msg-row { display: flex; flex-direction: column; }
+  .msg-row.in { align-items: flex-start; }
+  .msg-row.out { align-items: flex-end; }
+  .bubble-sender { font-size: 10px; color: #999; margin-bottom: 2px; padding: 0 4px; }
   .bubble { max-width: 75%; padding: 8px 12px; border-radius: 12px; font-size: 14px; line-height: 1.4; word-wrap: break-word; }
-  .bubble.in { background: #fff; align-self: flex-start; border: 1px solid #eee; }
-  .bubble.out { background: #06c755; color: #fff; align-self: flex-end; }
+  .bubble.in { background: #fff; border: 1px solid #eee; }
+  .bubble.out { background: #06c755; color: #fff; }
   .bubble.media { padding: 6px; }
   .bubble.media img { max-width: 220px; max-height: 220px; border-radius: 8px; display: block; cursor: pointer; }
   .bubble.media a { color: inherit; text-decoration: underline; }
@@ -95,10 +102,7 @@
 <body>
   <div id="sidebar">
     <h2>บทสนทนา (LINE OA)</h2>
-    <div id="identity-bar">
-      <span>คุณคือ:</span>
-      <select id="identity-select"></select>
-    </div>
+    <div id="identity-bar"></div>
     <div id="search-bar">
       <input type="text" id="search-input" placeholder="ค้นหาชื่อลูกค้า..." />
     </div>
@@ -112,8 +116,8 @@
 let currentUserId = null;
 let currentUserName = null;
 let currentTab = 'chat';
-let salesTeam = [];
-let currentSalesId = null;
+let currentUser = null;
+let teamRoster = [];
 let allConversations = [];
 
 const QUICK_REPLIES = [
@@ -133,17 +137,20 @@ function escapeAttr(str) {
 }
 
 async function init() {
-  try {
-    salesTeam = await fetch('/api/sales-team').then(r => r.json());
-  } catch (e) {
-    salesTeam = [];
+  const meRes = await fetch('/api/me');
+  if (!meRes.ok) {
+    window.location.href = '/login';
+    return;
   }
-  currentSalesId = localStorage.getItem('currentSalesId') || (salesTeam[0] && salesTeam[0].id) || null;
-  renderIdentitySwitcher();
-  document.getElementById('identity-select').addEventListener('change', e => {
-    currentSalesId = e.target.value;
-    localStorage.setItem('currentSalesId', currentSalesId);
-  });
+  currentUser = await meRes.json();
+  renderIdentityBar();
+
+  try {
+    teamRoster = await fetch('/api/team').then(r => r.json());
+  } catch (e) {
+    teamRoster = [];
+  }
+
   document.getElementById('search-input').addEventListener('input', renderConversationList);
   document.getElementById('conv-list').addEventListener('click', e => {
     const item = e.target.closest('.conv-item');
@@ -160,16 +167,41 @@ async function init() {
   }, 3000);
 }
 
-function renderIdentitySwitcher() {
-  const sel = document.getElementById('identity-select');
-  sel.innerHTML = salesTeam.map(s =>
-    `<option value="${escapeAttr(s.id)}" ${s.id === currentSalesId ? 'selected' : ''}>${escapeHtml(s.name)}</option>`
-  ).join('');
+function renderIdentityBar() {
+  const bar = document.getElementById('identity-bar');
+  bar.innerHTML = `
+    <span id="current-user-name">${escapeHtml(currentUser.display_name)}</span>
+    <button id="change-pw-btn" title="เปลี่ยนรหัสผ่าน">🔑</button>
+    ${currentUser.role === 'admin' ? '<button id="admin-link-btn" title="จัดการบัญชี">👥</button>' : ''}
+    <button id="logout-btn" title="ออกจากระบบ">ออก</button>
+  `;
+  document.getElementById('change-pw-btn').addEventListener('click', changePassword);
+  document.getElementById('logout-btn').addEventListener('click', async () => {
+    await fetch('/api/logout', { method: 'POST' });
+    window.location.href = '/login';
+  });
+  const adminBtn = document.getElementById('admin-link-btn');
+  if (adminBtn) {
+    adminBtn.addEventListener('click', () => { window.location.href = '/admin'; });
+  }
 }
 
-function getCurrentSalesName() {
-  const s = salesTeam.find(x => x.id === currentSalesId);
-  return s ? s.name : 'ไม่ระบุ';
+async function changePassword() {
+  const current = prompt('รหัสผ่านเดิม:');
+  if (current == null) return;
+  const next = prompt('รหัสผ่านใหม่ (อย่างน้อย 6 ตัวอักษร):');
+  if (next == null) return;
+  const res = await fetch('/api/me/change-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ current_password: current, new_password: next }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    alert('เปลี่ยนรหัสผ่านไม่สำเร็จ: ' + (err.detail || ''));
+    return;
+  }
+  alert('เปลี่ยนรหัสผ่านเรียบร้อย');
 }
 
 async function loadConversations() {
@@ -192,9 +224,9 @@ function renderConversationList() {
 
   list.innerHTML = filtered.map(c => {
     const t = new Date(c.last_at * 1000).toLocaleString('th-TH');
-    const assigned = salesTeam.find(s => s.id === c.assigned_to);
+    const assigned = teamRoster.find(s => String(s.id) === String(c.assigned_to));
     const badge = assigned
-      ? `<span class="assign-badge" style="background:${assigned.color}">${escapeHtml(assigned.name)}</span>`
+      ? `<span class="assign-badge" style="background:${assigned.color}">${escapeHtml(assigned.display_name)}</span>`
       : `<span class="assign-badge unassigned">ยังไม่มอบหมาย</span>`;
     return `
       <div class="conv-item ${c.user_id === currentUserId ? 'active' : ''}" data-user-id="${escapeAttr(c.user_id)}" data-name="${escapeAttr(c.display_name || c.user_id)}">
@@ -228,8 +260,8 @@ function renderChatFrame() {
   const conv = allConversations.find(c => c.user_id === currentUserId);
   const assignedTo = conv ? conv.assigned_to : null;
   const assignOptions = ['<option value="">ยังไม่มอบหมาย</option>']
-    .concat(salesTeam.map(s =>
-      `<option value="${escapeAttr(s.id)}" ${s.id === assignedTo ? 'selected' : ''}>${escapeHtml(s.name)}</option>`
+    .concat(teamRoster.map(s =>
+      `<option value="${escapeAttr(s.id)}" ${String(s.id) === String(assignedTo) ? 'selected' : ''}>${escapeHtml(s.display_name)}</option>`
     )).join('');
 
   document.getElementById('chat').innerHTML = `
@@ -323,13 +355,18 @@ function renderNotesTabContent() {
 }
 
 function renderBubble(m) {
+  const sender = (m.direction === 'out' && m.sender_name)
+    ? `<div class="bubble-sender">${escapeHtml(m.sender_name)}</div>`
+    : '';
+  let inner;
   if (m.msg_type === 'image' && m.media_id) {
-    return `<div class="bubble ${m.direction} media"><img src="/media/${m.media_id}" onclick="window.open('/media/${m.media_id}', '_blank')" /></div>`;
+    inner = `<div class="bubble ${m.direction} media"><img src="/media/${m.media_id}" onclick="window.open('/media/${m.media_id}', '_blank')" /></div>`;
+  } else if (m.msg_type === 'file' && m.media_id) {
+    inner = `<div class="bubble ${m.direction} media"><a href="/media/${m.media_id}" target="_blank">📎 ${escapeHtml(m.text || 'ไฟล์แนบ')}</a></div>`;
+  } else {
+    inner = `<div class="bubble ${m.direction}">${escapeHtml(m.text)}</div>`;
   }
-  if (m.msg_type === 'file' && m.media_id) {
-    return `<div class="bubble ${m.direction} media"><a href="/media/${m.media_id}" target="_blank">📎 ${escapeHtml(m.text || 'ไฟล์แนบ')}</a></div>`;
-  }
-  return `<div class="bubble ${m.direction}">${escapeHtml(m.text)}</div>`;
+  return `<div class="msg-row ${m.direction}">${sender}${inner}</div>`;
 }
 
 async function loadMessages() {
@@ -411,20 +448,18 @@ async function addNote() {
   const text = textEl.value.trim();
   const file = fileEl.files[0];
   if (!text && !file) return;
-  const author = getCurrentSalesName();
 
   let res;
   if (file) {
     const fd = new FormData();
     fd.append('file', file);
-    fd.append('author', author);
     fd.append('text', text);
     res = await fetch(`/api/conversations/${currentUserId}/notes-media`, { method: 'POST', body: fd });
   } else {
     res = await fetch(`/api/conversations/${currentUserId}/notes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ author, text })
+      body: JSON.stringify({ text })
     });
   }
   if (!res.ok) {
