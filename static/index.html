@@ -11,6 +11,9 @@
 
   #sidebar { width: 300px; background: #fff; border-right: 1px solid #ddd; display: flex; flex-direction: column; flex-shrink: 0; }
   #sidebar h2 { font-size: 15px; padding: 14px 16px 8px; margin: 0; }
+  #channel-bar { padding: 14px 16px 8px; }
+  #channel-name { font-size: 15px; font-weight: 600; }
+  #channel-select { width: 100%; padding: 8px 10px; border: 1px solid #ccc; border-radius: 8px; font-size: 14px; font-weight: 600; background: #fafafa; }
   #identity-bar { padding: 0 16px 10px; display: flex; align-items: center; gap: 6px; font-size: 13px; color: #555; }
   #identity-bar select { flex: 1; padding: 6px 8px; border: 1px solid #ccc; border-radius: 8px; font-size: 13px; background: #fafafa; }
   #current-user-name { flex: 1; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -85,6 +88,14 @@
   .profile-empty button, .resend-btn { margin-top: 14px; padding: 10px 18px; background: #06c755; color: #fff; border: none; border-radius: 10px; cursor: pointer; font-size: 14px; }
   .resend-btn { display: block; margin: 14px auto 0; }
 
+  #cross-oa-section { margin-top: 20px; }
+  .cross-oa-title { font-size: 13px; font-weight: 600; color: #555; margin-bottom: 8px; }
+  .cross-oa-loading, .cross-oa-empty { font-size: 13px; color: #999; padding: 8px 0; }
+  .cross-oa-card { background: #f7f9fc; border: 1px solid #e3e8f0; border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
+  .cross-oa-name { font-size: 14px; font-weight: 600; color: #2c3e50; }
+  .cross-oa-meta { font-size: 12px; color: #888; margin-top: 2px; }
+  .cross-oa-assigned { font-size: 12px; color: #06834a; margin-top: 4px; }
+
   #placeholder { margin: auto; color: #999; padding: 16px; text-align: center; }
 
   @media (max-width: 768px) {
@@ -102,7 +113,7 @@
 </head>
 <body>
   <div id="sidebar">
-    <h2>บทสนทนา (LINE OA)</h2>
+    <div id="channel-bar"></div>
     <div id="identity-bar"></div>
     <div id="search-bar">
       <input type="text" id="search-input" placeholder="ค้นหาชื่อลูกค้า..." />
@@ -120,6 +131,8 @@ let currentTab = 'chat';
 let currentUser = null;
 let teamRoster = [];
 let allConversations = [];
+let channels = [];
+let currentChannel = null;
 
 const QUICK_REPLIES = [
   { label: 'ทักทาย', text: 'สวัสดีค่ะ/ครับ ขอบคุณที่สนใจโครงการของเรา รบกวนสอบถามงบประมาณและประเภทห้องที่สนใจได้ไหมคะ' },
@@ -147,6 +160,17 @@ async function init() {
   renderIdentityBar();
 
   try {
+    channels = await fetch('/api/channels').then(r => r.json());
+  } catch (e) {
+    channels = [];
+  }
+  const savedChannel = localStorage.getItem('lineOaChannel');
+  currentChannel = (savedChannel && channels.some(c => c.key === savedChannel))
+    ? savedChannel
+    : (channels[0] ? channels[0].key : null);
+  renderChannelBar();
+
+  try {
     teamRoster = await fetch('/api/team').then(r => r.json());
   } catch (e) {
     teamRoster = [];
@@ -166,6 +190,32 @@ async function init() {
     else if (currentTab === 'notes') loadNotes();
     else if (currentTab === 'profile') loadProfile();
   }, 3000);
+}
+
+function renderChannelBar() {
+  const bar = document.getElementById('channel-bar');
+  if (!channels || channels.length === 0) {
+    bar.innerHTML = '<div id="channel-name">LINE OA External Chat</div>';
+    return;
+  }
+  if (channels.length === 1) {
+    bar.innerHTML = `<div id="channel-name">${escapeHtml(channels[0].name)}</div>`;
+    return;
+  }
+  bar.innerHTML = `<select id="channel-select">${channels.map(c =>
+    `<option value="${escapeAttr(c.key)}" ${c.key === currentChannel ? 'selected' : ''}>${escapeHtml(c.name)}</option>`
+  ).join('')}</select>`;
+  document.getElementById('channel-select').addEventListener('change', onChannelChange);
+}
+
+function onChannelChange(e) {
+  currentChannel = e.target.value;
+  localStorage.setItem('lineOaChannel', currentChannel);
+  currentUserId = null;
+  currentUserName = null;
+  document.body.classList.remove('chat-open');
+  document.getElementById('chat').innerHTML = '<div id="placeholder">เลือกบทสนทนาทางซ้ายเพื่อตอบแชท</div>';
+  loadConversations();
 }
 
 function renderIdentityBar() {
@@ -233,7 +283,12 @@ async function changePassword() {
 }
 
 async function loadConversations() {
-  const res = await fetch('/api/conversations');
+  if (!currentChannel) {
+    allConversations = [];
+    renderConversationList();
+    return;
+  }
+  const res = await fetch(`/api/${currentChannel}/conversations`);
   allConversations = await res.json();
   renderConversationList();
 }
@@ -325,7 +380,7 @@ function renderChatFrame() {
 
 async function onAssignChange(e) {
   const val = e.target.value || null;
-  await fetch(`/api/conversations/${currentUserId}/assign`, {
+  await fetch(`/api/${currentChannel}/conversations/${currentUserId}/assign`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ assigned_to: val })
@@ -399,7 +454,7 @@ function renderBubble(m) {
 
 async function loadMessages() {
   if (!currentUserId) return;
-  const res = await fetch(`/api/conversations/${currentUserId}/messages`);
+  const res = await fetch(`/api/${currentChannel}/conversations/${currentUserId}/messages`);
   const msgs = await res.json();
   const box = document.getElementById('messages');
   if (!box) return;
@@ -413,7 +468,7 @@ async function sendReply() {
   const text = input.value.trim();
   if (!text || !currentUserId) return;
   input.value = '';
-  const res = await fetch(`/api/conversations/${currentUserId}/reply`, {
+  const res = await fetch(`/api/${currentChannel}/conversations/${currentUserId}/reply`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text })
@@ -432,7 +487,7 @@ async function handleFileSelected(e) {
   const formData = new FormData();
   formData.append('file', file);
   formData.append('kind', kind);
-  const res = await fetch(`/api/conversations/${currentUserId}/reply-media`, {
+  const res = await fetch(`/api/${currentChannel}/conversations/${currentUserId}/reply-media`, {
     method: 'POST',
     body: formData
   });
@@ -445,7 +500,7 @@ async function handleFileSelected(e) {
 
 async function loadNotes() {
   if (!currentUserId) return;
-  const res = await fetch(`/api/conversations/${currentUserId}/notes`);
+  const res = await fetch(`/api/${currentChannel}/conversations/${currentUserId}/notes`);
   const notes = await res.json();
   const box = document.getElementById('notes-list');
   if (!box) return;
@@ -482,9 +537,9 @@ async function addNote() {
     const fd = new FormData();
     fd.append('file', file);
     fd.append('text', text);
-    res = await fetch(`/api/conversations/${currentUserId}/notes-media`, { method: 'POST', body: fd });
+    res = await fetch(`/api/${currentChannel}/conversations/${currentUserId}/notes-media`, { method: 'POST', body: fd });
   } else {
-    res = await fetch(`/api/conversations/${currentUserId}/notes`, {
+    res = await fetch(`/api/${currentChannel}/conversations/${currentUserId}/notes`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text })
@@ -507,7 +562,7 @@ function renderProfileTabContent() {
 
 async function loadProfile() {
   if (!currentUserId) return;
-  const res = await fetch(`/api/conversations/${currentUserId}/profile`);
+  const res = await fetch(`/api/${currentChannel}/conversations/${currentUserId}/profile`);
   const p = await res.json();
   const box = document.getElementById('profile-content');
   if (!box) return;
@@ -536,8 +591,36 @@ async function loadProfile() {
       <div class="profile-row"><span class="profile-label">อัปเดตล่าสุด</span><span class="profile-value">${updated}</span></div>
     </div>
     <button id="send-link-btn" class="resend-btn">ส่งลิงก์ขอข้อมูลอีกครั้ง</button>
+    <div id="cross-oa-section"></div>
   `;
   document.getElementById('send-link-btn').addEventListener('click', sendRegistrationLink);
+  loadCrossOaHistory();
+}
+
+async function loadCrossOaHistory() {
+  const section = document.getElementById('cross-oa-section');
+  if (!section || !currentUserId) return;
+  section.innerHTML = '<div class="cross-oa-title">เคยทักติดต่อโครงการอื่นด้วย</div><div class="cross-oa-loading">กำลังโหลด...</div>';
+  try {
+    const res = await fetch(`/api/${currentChannel}/conversations/${currentUserId}/cross-oa-history`);
+    const rows = await res.json();
+    if (!res.ok || !Array.isArray(rows) || rows.length === 0) {
+      section.innerHTML = '<div class="cross-oa-title">เคยทักติดต่อโครงการอื่นด้วย</div><div class="cross-oa-empty">ไม่พบว่าเคยทักโครงการอื่น (จับคู่จากอีเมล/เบอร์โทรที่กรอกไว้)</div>';
+      return;
+    }
+    section.innerHTML = `
+      <div class="cross-oa-title">เคยทักติดต่อโครงการอื่นด้วย</div>
+      ${rows.map(r => `
+        <div class="cross-oa-card">
+          <div class="cross-oa-name">${escapeHtml(r.channel_name)}</div>
+          <div class="cross-oa-meta">คุยล่าสุด ${new Date(r.last_at * 1000).toLocaleString('th-TH')} · ${r.message_count} ข้อความ</div>
+          ${r.assigned_to_name ? `<div class="cross-oa-assigned">ผู้ดูแล: ${escapeHtml(r.assigned_to_name)}</div>` : ''}
+        </div>
+      `).join('')}
+    `;
+  } catch (e) {
+    section.innerHTML = '';
+  }
 }
 
 async function sendRegistrationLink() {
@@ -548,7 +631,7 @@ async function sendRegistrationLink() {
     btn.textContent = 'กำลังส่ง...';
   }
   try {
-    const res = await fetch(`/api/conversations/${currentUserId}/send-registration-link`, { method: 'POST' });
+    const res = await fetch(`/api/${currentChannel}/conversations/${currentUserId}/send-registration-link`, { method: 'POST' });
     if (!res.ok) {
       alert('ส่งลิงก์ไม่สำเร็จ: ' + await res.text());
       if (btn) {

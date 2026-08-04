@@ -20,10 +20,62 @@ from pathlib import Path
 
 load_dotenv()
 
-CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
-CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
-LIFF_ID = os.getenv("LIFF_ID", "")
+
+# ---------------------------------------------------------------------------
+# Multi-OA channel configuration
+#
+# Each LINE Official Account (one per real-estate project) is a "channel"
+# here, identified by a short `key` (e.g. "peacehome"). Every channel needs
+# its own Messaging API access token + secret, and (optionally) its own LIFF
+# app id for the registration form / rich menu.
+#
+# The very first OA this POC was built against keeps working with no changes
+# needed to its LINE console setup (webhook URL, LIFF endpoint URL, etc.) —
+# it's automatically registered as DEFAULT_CHANNEL_KEY from the legacy
+# LINE_CHANNEL_ACCESS_TOKEN / LINE_CHANNEL_SECRET / LIFF_ID env vars.
+#
+# To add another project's OA, add an entry to LINE_CHANNELS_JSON in .env —
+# see README.md "เพิ่ม LINE OA โครงการใหม่" for the exact steps.
+# ---------------------------------------------------------------------------
+
+DEFAULT_CHANNEL_KEY = os.getenv("LINE_CHANNEL_KEY", "default")
+DEFAULT_CHANNEL_NAME = os.getenv("LINE_CHANNEL_NAME", "โครงการหลัก")
+
+
+def load_channels() -> dict:
+    channels: dict = {}
+    raw = os.getenv("LINE_CHANNELS_JSON", "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except Exception as e:
+            raise RuntimeError(f"LINE_CHANNELS_JSON is not valid JSON: {e}")
+        for c in parsed:
+            key = c["key"]
+            channels[key] = {
+                "key": key,
+                "name": c.get("name", key),
+                "access_token": c["access_token"],
+                "secret": c.get("secret", ""),
+                "liff_id": c.get("liff_id", ""),
+            }
+
+    # Legacy single-channel env vars (from before multi-OA support existed).
+    # Kept working as-is so the OA already live today needs zero changes.
+    legacy_token = os.getenv("LINE_CHANNEL_ACCESS_TOKEN", "")
+    if legacy_token and DEFAULT_CHANNEL_KEY not in channels:
+        channels[DEFAULT_CHANNEL_KEY] = {
+            "key": DEFAULT_CHANNEL_KEY,
+            "name": DEFAULT_CHANNEL_NAME,
+            "access_token": legacy_token,
+            "secret": os.getenv("LINE_CHANNEL_SECRET", ""),
+            "liff_id": os.getenv("LIFF_ID", ""),
+        }
+    return channels
+
+
+CHANNELS = load_channels()
 
 # Used to sign the login session cookie. If not set, a random one is
 # generated per process start — that just means everyone gets logged out
@@ -53,6 +105,41 @@ def get_pool() -> SimpleConnectionPool:
             )
         _pool = SimpleConnectionPool(1, 5, dsn=DATABASE_URL)
     return _pool
+
+
+def get_channel(channel_key: str) -> dict:
+    ch = CHANNELS.get(channel_key)
+    if not ch:
+        raise HTTPException(status_code=404, detail=f"unknown channel: {channel_key}")
+    return ch
+
+
+def _ensure_channel_key_column(cur, table: str, default_key: str):
+    """Add a channel_key column (backfilled to `default_key` for pre-existing
+    rows) so every table that used to assume "one OA" can now be scoped per
+    LINE OA/project."""
+    cur.execute(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS channel_key TEXT")
+    cur.execute(f"UPDATE {table} SET channel_key = %s WHERE channel_key IS NULL", (default_key,))
+    cur.execute(f"ALTER TABLE {table} ALTER COLUMN channel_key SET NOT NULL")
+
+
+def _ensure_composite_pk(cur, table: str, pk_name: str, cols: list[str]):
+    """Widen a table's primary key to include channel_key, so the same LINE
+    user_id can exist once per channel instead of only once globally. Safe to
+    call every startup — it only alters the constraint if it doesn't already
+    match `cols`."""
+    cur.execute(
+        """
+        SELECT a.attname FROM pg_constraint co
+        JOIN pg_attribute a ON a.attrelid = co.conrelid AND a.attnum = ANY(co.conkey)
+        WHERE co.conname = %s AND co.conrelid = %s::regclass
+        """,
+        (pk_name, table),
+    )
+    current_cols = {r[0] for r in cur.fetchall()}
+    if current_cols != set(cols):
+        cur.execute(f"ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {pk_name}")
+        cur.execute(f"ALTER TABLE {table} ADD PRIMARY KEY ({', '.join(cols)})")
 
 
 def init_db():
@@ -90,6 +177,9 @@ def init_db():
             # Migration: who (which logged-in account) sent each outbound message.
             cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_user_id INTEGER")
             cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS sender_name TEXT")
+            # Migration: which LINE OA / project this message belongs to.
+            _ensure_channel_key_column(cur, "messages", DEFAULT_CHANNEL_KEY)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_user ON messages (channel_key, user_id, created_at)")
             # LINE sometimes redelivers the same webhook event (e.g. if our
             # server was slow to respond, such as waking up from sleep on
             # Render's free tier). This unique index + ON CONFLICT DO NOTHING
@@ -110,6 +200,12 @@ def init_db():
                 )
                 """
             )
+            # Migration: scope conversation assignment per channel too, so the
+            # same LINE user_id in two different OAs can be assigned to
+            # different salespeople.
+            _ensure_channel_key_column(cur, "conversation_meta", DEFAULT_CHANNEL_KEY)
+            _ensure_composite_pk(cur, "conversation_meta", "conversation_meta_pkey", ["channel_key", "user_id"])
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS notes (
@@ -122,6 +218,8 @@ def init_db():
                 )
                 """
             )
+            _ensure_channel_key_column(cur, "notes", DEFAULT_CHANNEL_KEY)
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS customer_profile (
@@ -136,6 +234,14 @@ def init_db():
                 )
                 """
             )
+            # Migration: a customer can have a profile per OA/project (their
+            # LINE user_id may differ across OAs unless all OAs share one
+            # LINE Developers Provider — see README "หลาย LINE OA / โครงการ").
+            _ensure_channel_key_column(cur, "customer_profile", DEFAULT_CHANNEL_KEY)
+            _ensure_composite_pk(cur, "customer_profile", "customer_profile_pkey", ["channel_key", "user_id"])
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_profile_email ON customer_profile (email)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_customer_profile_phone ON customer_profile (phone)")
+
             cur.execute(
                 """
                 CREATE TABLE IF NOT EXISTS admin_users (
@@ -274,11 +380,12 @@ def build_sender(current_user: dict, request: Request) -> dict | None:
     return {"name": name, "iconUrl": icon_url}
 
 
-# Paths reachable without being logged in. /media/* must stay public because
-# LINE's own servers fetch outbound images/files from that URL with no
-# browser session, and customers open file-download links directly.
+# Paths reachable without being logged in. /media/*, /webhook/* and
+# /register/* must stay public: LINE's own servers call the webhook and fetch
+# outbound images/files with no browser session, and customers open
+# registration/file-download links directly from LINE chat.
 PUBLIC_EXACT_PATHS = {"/webhook", "/register", "/healthz", "/login", "/api/login", "/api/customer-profile"}
-PUBLIC_PATH_PREFIXES = ("/media/",)
+PUBLIC_PATH_PREFIXES = ("/media/", "/webhook/", "/register/")
 
 
 @app.middleware("http")
@@ -299,21 +406,22 @@ async def require_login_middleware(request: Request, call_next):
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY, session_cookie="line_oa_session", max_age=60 * 60 * 24 * 30)
 
 
-def verify_signature(body: bytes, signature: str) -> bool:
-    """Verify LINE webhook signature. If CHANNEL_SECRET is not set (local dev
-    before LINE credentials exist), skip verification so the app still runs."""
-    if not CHANNEL_SECRET:
+def verify_signature(body: bytes, signature: str, channel_secret: str) -> bool:
+    """Verify LINE webhook signature. If the channel has no secret configured
+    (local dev before LINE credentials exist), skip verification so the app
+    still runs."""
+    if not channel_secret:
         return True
-    digest = hmac.new(CHANNEL_SECRET.encode("utf-8"), body, hashlib.sha256).digest()
+    digest = hmac.new(channel_secret.encode("utf-8"), body, hashlib.sha256).digest()
     expected = base64.b64encode(digest).decode("utf-8")
     return hmac.compare_digest(expected, signature or "")
 
 
-async def fetch_display_name(user_id: str) -> str:
-    if not CHANNEL_ACCESS_TOKEN:
+async def fetch_display_name(user_id: str, access_token: str) -> str:
+    if not access_token:
         return user_id
     url = f"https://api.line.me/v2/bot/profile/{user_id}"
-    headers = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}
+    headers = {"Authorization": f"Bearer {access_token}"}
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(url, headers=headers)
@@ -324,11 +432,11 @@ async def fetch_display_name(user_id: str) -> str:
     return user_id
 
 
-async def download_line_content(message_id: str) -> tuple[bytes, str]:
+async def download_line_content(message_id: str, access_token: str) -> tuple[bytes, str]:
     """Download image/video/audio/file content sent by a user via the
     LINE Content API. Returns (bytes, content_type)."""
     url = f"https://api-data.line.me/v2/bot/message/{message_id}/content"
-    headers = {"Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"}
+    headers = {"Authorization": f"Bearer {access_token}"}
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(url, headers=headers)
         resp.raise_for_status()
@@ -360,6 +468,7 @@ def get_media(media_id: int):
 
 
 def save_message(
+    channel_key: str,
     user_id: str,
     display_name: str,
     direction: str,
@@ -375,12 +484,12 @@ def save_message(
         with conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO messages (user_id, display_name, direction, msg_type, text, media_id, created_at, line_message_id, sender_user_id, sender_name)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO messages (channel_key, user_id, display_name, direction, msg_type, text, media_id, created_at, line_message_id, sender_user_id, sender_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (line_message_id) WHERE line_message_id IS NOT NULL DO NOTHING
                 """,
                 (
-                    user_id, display_name, direction, msg_type, text, media_id,
+                    channel_key, user_id, display_name, direction, msg_type, text, media_id,
                     time.time(), line_message_id, sender_user_id, sender_name,
                 ),
             )
@@ -398,17 +507,17 @@ def is_duplicate_line_message(line_message_id: str) -> bool:
         get_pool().putconn(conn)
 
 
-def get_known_display_name(user_id: str) -> str:
+def get_known_display_name(channel_key: str, user_id: str) -> str:
     conn = get_pool().getconn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
                 SELECT display_name FROM messages
-                WHERE user_id = %s AND display_name IS NOT NULL AND display_name != ''
+                WHERE channel_key = %s AND user_id = %s AND display_name IS NOT NULL AND display_name != ''
                 ORDER BY created_at DESC LIMIT 1
                 """,
-                (user_id,),
+                (channel_key, user_id),
             )
             row = cur.fetchone()
             return row["display_name"] if row else user_id
@@ -421,12 +530,19 @@ def healthz():
     return {"status": "ok"}
 
 
-@app.post("/webhook")
-async def line_webhook(request: Request):
+@app.get("/api/channels")
+def api_list_channels(current_user: dict = Depends(get_current_user)):
+    """Every configured LINE OA/project, for the channel switcher in the
+    admin UI."""
+    return [{"key": c["key"], "name": c["name"]} for c in CHANNELS.values()]
+
+
+async def _handle_webhook(channel_key: str, request: Request):
+    ch = get_channel(channel_key)
     body = await request.body()
     signature = request.headers.get("X-Line-Signature", "")
 
-    if not verify_signature(body, signature):
+    if not verify_signature(body, signature, ch["secret"]):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     payload = json.loads(body) if body else {}
@@ -447,20 +563,20 @@ async def line_webhook(request: Request):
         if line_message_id and is_duplicate_line_message(line_message_id):
             continue
 
-        display_name = await fetch_display_name(user_id)
+        display_name = await fetch_display_name(user_id, ch["access_token"])
 
         if msg_type == "text":
             save_message(
-                user_id, display_name, "in", "text",
+                channel_key, user_id, display_name, "in", "text",
                 text=message.get("text", ""), line_message_id=line_message_id,
             )
 
         elif msg_type in ("image", "file", "video", "audio"):
             try:
-                data, content_type = await download_line_content(message["id"])
+                data, content_type = await download_line_content(message["id"], ch["access_token"])
             except Exception:
                 save_message(
-                    user_id, display_name, "in", "text",
+                    channel_key, user_id, display_name, "in", "text",
                     text=f"[ไม่สามารถดาวน์โหลด {msg_type} จากลูกค้าได้]",
                     line_message_id=line_message_id,
                 )
@@ -473,13 +589,13 @@ async def line_webhook(request: Request):
                 filename = f"{msg_type}.{ext}"
             media_id = save_media(content_type, filename, data)
             save_message(
-                user_id, display_name, "in", stored_type,
+                channel_key, user_id, display_name, "in", stored_type,
                 text=filename, media_id=media_id, line_message_id=line_message_id,
             )
 
         else:
             save_message(
-                user_id, display_name, "in", "text",
+                channel_key, user_id, display_name, "in", "text",
                 text=f"[ลูกค้าส่ง {msg_type} มา — ยังไม่รองรับการแสดงผลประเภทนี้]",
                 line_message_id=line_message_id,
             )
@@ -487,8 +603,21 @@ async def line_webhook(request: Request):
     return JSONResponse({"status": "ok"})
 
 
-@app.get("/api/conversations")
-def list_conversations(current_user: dict = Depends(get_current_user)):
+@app.post("/webhook/{channel_key}")
+async def line_webhook(channel_key: str, request: Request):
+    return await _handle_webhook(channel_key, request)
+
+
+@app.post("/webhook")
+async def line_webhook_default(request: Request):
+    # Legacy URL from before multi-OA support — the OA already configured
+    # with this webhook URL in the LINE console keeps working unchanged.
+    return await _handle_webhook(DEFAULT_CHANNEL_KEY, request)
+
+
+@app.get("/api/{channel_key}/conversations")
+def list_conversations(channel_key: str, current_user: dict = Depends(get_current_user)):
+    get_channel(channel_key)
     conn = get_pool().getconn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
@@ -496,10 +625,12 @@ def list_conversations(current_user: dict = Depends(get_current_user)):
                 """
                 SELECT m.user_id, MAX(m.created_at) as last_at, cm.assigned_to
                 FROM messages m
-                LEFT JOIN conversation_meta cm ON cm.user_id = m.user_id
+                LEFT JOIN conversation_meta cm ON cm.user_id = m.user_id AND cm.channel_key = m.channel_key
+                WHERE m.channel_key = %s
                 GROUP BY m.user_id, cm.assigned_to
                 ORDER BY last_at DESC
-                """
+                """,
+                (channel_key,),
             )
             rows = cur.fetchall()
     finally:
@@ -510,7 +641,7 @@ def list_conversations(current_user: dict = Depends(get_current_user)):
         result.append(
             {
                 "user_id": r["user_id"],
-                "display_name": get_known_display_name(r["user_id"]),
+                "display_name": get_known_display_name(channel_key, r["user_id"]),
                 "last_at": r["last_at"],
                 "assigned_to": r["assigned_to"],
             }
@@ -518,8 +649,9 @@ def list_conversations(current_user: dict = Depends(get_current_user)):
     return result
 
 
-@app.post("/api/conversations/{user_id}/assign")
-async def assign_conversation(user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+@app.post("/api/{channel_key}/conversations/{user_id}/assign")
+async def assign_conversation(channel_key: str, user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    get_channel(channel_key)
     body = await request.json()
     assigned_to = body.get("assigned_to")  # an admin_users id (as string), or null to unassign
     conn = get_pool().getconn()
@@ -527,53 +659,56 @@ async def assign_conversation(user_id: str, request: Request, current_user: dict
         with conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO conversation_meta (user_id, assigned_to, updated_at)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET assigned_to = EXCLUDED.assigned_to, updated_at = EXCLUDED.updated_at
+                INSERT INTO conversation_meta (channel_key, user_id, assigned_to, updated_at)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (channel_key, user_id) DO UPDATE SET assigned_to = EXCLUDED.assigned_to, updated_at = EXCLUDED.updated_at
                 """,
-                (user_id, assigned_to, time.time()),
+                (channel_key, user_id, assigned_to, time.time()),
             )
     finally:
         get_pool().putconn(conn)
     return {"status": "ok", "assigned_to": assigned_to}
 
 
-@app.get("/api/conversations/{user_id}/messages")
-def get_messages(user_id: str, current_user: dict = Depends(get_current_user)):
+@app.get("/api/{channel_key}/conversations/{user_id}/messages")
+def get_messages(channel_key: str, user_id: str, current_user: dict = Depends(get_current_user)):
+    get_channel(channel_key)
     conn = get_pool().getconn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
                 SELECT direction, msg_type, text, media_id, created_at, sender_name
-                FROM messages WHERE user_id = %s ORDER BY created_at ASC
+                FROM messages WHERE channel_key = %s AND user_id = %s ORDER BY created_at ASC
                 """,
-                (user_id,),
+                (channel_key, user_id),
             )
             return [dict(r) for r in cur.fetchall()]
     finally:
         get_pool().putconn(conn)
 
 
-@app.get("/api/conversations/{user_id}/notes")
-def get_notes(user_id: str, current_user: dict = Depends(get_current_user)):
+@app.get("/api/{channel_key}/conversations/{user_id}/notes")
+def get_notes(channel_key: str, user_id: str, current_user: dict = Depends(get_current_user)):
+    get_channel(channel_key)
     conn = get_pool().getconn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
                 SELECT id, author, text, media_id, created_at
-                FROM notes WHERE user_id = %s ORDER BY created_at ASC
+                FROM notes WHERE channel_key = %s AND user_id = %s ORDER BY created_at ASC
                 """,
-                (user_id,),
+                (channel_key, user_id),
             )
             return [dict(r) for r in cur.fetchall()]
     finally:
         get_pool().putconn(conn)
 
 
-@app.post("/api/conversations/{user_id}/notes")
-async def add_note(user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+@app.post("/api/{channel_key}/conversations/{user_id}/notes")
+async def add_note(channel_key: str, user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    get_channel(channel_key)
     body = await request.json()
     text = (body.get("text") or "").strip()
     if not text:
@@ -582,21 +717,23 @@ async def add_note(user_id: str, request: Request, current_user: dict = Depends(
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO notes (user_id, author, text, created_at) VALUES (%s, %s, %s, %s)",
-                (user_id, current_user["display_name"], text, time.time()),
+                "INSERT INTO notes (channel_key, user_id, author, text, created_at) VALUES (%s, %s, %s, %s, %s)",
+                (channel_key, user_id, current_user["display_name"], text, time.time()),
             )
     finally:
         get_pool().putconn(conn)
     return {"status": "ok"}
 
 
-@app.post("/api/conversations/{user_id}/notes-media")
+@app.post("/api/{channel_key}/conversations/{user_id}/notes-media")
 async def add_note_with_media(
+    channel_key: str,
     user_id: str,
     text: str = Form(""),
     file: UploadFile = File(...),
     current_user: dict = Depends(get_current_user),
 ):
+    get_channel(channel_key)
     data = await file.read()
     if not data:
         raise HTTPException(status_code=400, detail="empty file")
@@ -606,25 +743,26 @@ async def add_note_with_media(
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO notes (user_id, author, text, media_id, created_at) VALUES (%s, %s, %s, %s, %s)",
-                (user_id, current_user["display_name"], text.strip(), media_id, time.time()),
+                "INSERT INTO notes (channel_key, user_id, author, text, media_id, created_at) VALUES (%s, %s, %s, %s, %s, %s)",
+                (channel_key, user_id, current_user["display_name"], text.strip(), media_id, time.time()),
             )
     finally:
         get_pool().putconn(conn)
     return {"status": "ok", "media_id": media_id}
 
 
-@app.get("/api/conversations/{user_id}/profile")
-def get_customer_profile(user_id: str, current_user: dict = Depends(get_current_user)):
+@app.get("/api/{channel_key}/conversations/{user_id}/profile")
+def get_customer_profile(channel_key: str, user_id: str, current_user: dict = Depends(get_current_user)):
+    get_channel(channel_key)
     conn = get_pool().getconn()
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
                 SELECT email, phone, first_name, last_name, birthday, consent_at, updated_at
-                FROM customer_profile WHERE user_id = %s
+                FROM customer_profile WHERE channel_key = %s AND user_id = %s
                 """,
-                (user_id,),
+                (channel_key, user_id),
             )
             row = cur.fetchone()
             return dict(row) if row else {}
@@ -632,12 +770,82 @@ def get_customer_profile(user_id: str, current_user: dict = Depends(get_current_
         get_pool().putconn(conn)
 
 
+@app.get("/api/{channel_key}/conversations/{user_id}/cross-oa-history")
+def get_cross_oa_history(channel_key: str, user_id: str, current_user: dict = Depends(get_current_user)):
+    """Other LINE OAs/projects this same customer has contacted before, matched
+    by email/phone from the registration form (see README "หลาย LINE OA /
+    โครงการ" for why matching isn't done by LINE user_id — that only works
+    for OAs that share one LINE Developers Provider)."""
+    get_channel(channel_key)
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT email, phone FROM customer_profile WHERE channel_key = %s AND user_id = %s",
+                (channel_key, user_id),
+            )
+            me = cur.fetchone()
+            if not me or not (me["email"] or me["phone"]):
+                return []
+
+            cur.execute(
+                """
+                SELECT channel_key, user_id
+                FROM customer_profile
+                WHERE NOT (channel_key = %s AND user_id = %s)
+                  AND ((email IS NOT NULL AND email = %s) OR (phone IS NOT NULL AND phone = %s))
+                """,
+                (channel_key, user_id, me["email"], me["phone"]),
+            )
+            matches = cur.fetchall()
+
+            results = []
+            for m in matches:
+                other_key, other_user = m["channel_key"], m["user_id"]
+                cur.execute(
+                    "SELECT COUNT(*) AS cnt, MAX(created_at) AS last_at FROM messages WHERE channel_key = %s AND user_id = %s",
+                    (other_key, other_user),
+                )
+                stats = cur.fetchone()
+                if not stats or not stats["cnt"]:
+                    continue
+                cur.execute(
+                    "SELECT assigned_to FROM conversation_meta WHERE channel_key = %s AND user_id = %s",
+                    (other_key, other_user),
+                )
+                meta = cur.fetchone()
+                assigned_name = None
+                if meta and meta["assigned_to"]:
+                    au = get_admin_user_by_id(meta["assigned_to"])
+                    assigned_name = au["display_name"] if au else None
+                ch = CHANNELS.get(other_key)
+                results.append(
+                    {
+                        "channel_key": other_key,
+                        "channel_name": ch["name"] if ch else other_key,
+                        "user_id": other_user,
+                        "last_at": stats["last_at"],
+                        "message_count": stats["cnt"],
+                        "assigned_to_name": assigned_name,
+                    }
+                )
+            results.sort(key=lambda r: r["last_at"] or 0, reverse=True)
+            return results
+    finally:
+        get_pool().putconn(conn)
+
+
 @app.post("/api/customer-profile")
 async def save_customer_profile(request: Request):
-    """Called from the /register LIFF form the customer fills in themselves."""
+    """Called from the /register/{channel_key} LIFF form the customer fills
+    in themselves — public, no login required."""
     body = await request.json()
+    channel_key = (body.get("channel_key") or DEFAULT_CHANNEL_KEY).strip()
+    if channel_key not in CHANNELS:
+        raise HTTPException(status_code=400, detail=f"unknown channel: {channel_key}")
+
     user_id = (body.get("user_id") or "").strip()
-    email = (body.get("email") or "").strip()
+    email = (body.get("email") or "").strip().lower()
     phone = (body.get("phone") or "").strip()
     first_name = (body.get("first_name") or "").strip()
     last_name = (body.get("last_name") or "").strip()
@@ -652,9 +860,9 @@ async def save_customer_profile(request: Request):
         with conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO customer_profile (user_id, email, phone, first_name, last_name, birthday, consent_at, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET
+                INSERT INTO customer_profile (channel_key, user_id, email, phone, first_name, last_name, birthday, consent_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (channel_key, user_id) DO UPDATE SET
                     email = EXCLUDED.email,
                     phone = EXCLUDED.phone,
                     first_name = EXCLUDED.first_name,
@@ -663,29 +871,30 @@ async def save_customer_profile(request: Request):
                     consent_at = EXCLUDED.consent_at,
                     updated_at = EXCLUDED.updated_at
                 """,
-                (user_id, email, phone or None, first_name, last_name, birthday or None, now, now),
+                (channel_key, user_id, email, phone or None, first_name, last_name, birthday or None, now, now),
             )
     finally:
         get_pool().putconn(conn)
     return {"status": "ok"}
 
 
-@app.post("/api/conversations/{user_id}/send-registration-link")
-async def send_registration_link(user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
-    if not CHANNEL_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="LINE_CHANNEL_ACCESS_TOKEN is not set on the server")
-    if not LIFF_ID:
-        raise HTTPException(status_code=500, detail="LIFF_ID is not set on the server (see README)")
+@app.post("/api/{channel_key}/conversations/{user_id}/send-registration-link")
+async def send_registration_link(channel_key: str, user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    ch = get_channel(channel_key)
+    if not ch["access_token"]:
+        raise HTTPException(status_code=500, detail="channel has no access_token configured")
+    if not ch["liff_id"]:
+        raise HTTPException(status_code=500, detail="channel has no liff_id configured (see README)")
 
-    link = f"https://liff.line.me/{LIFF_ID}"
+    link = f"https://liff.line.me/{ch['liff_id']}"
     text = f"รบกวนกรอกข้อมูลติดต่อเพิ่มเติมที่ลิงก์นี้ด้วยนะคะ/ครับ 🙏\n{link}"
     message = {"type": "text", "text": text}
     sender = build_sender(current_user, request)
     if sender:
         message["sender"] = sender
-    await push_message(user_id, [message])
+    await push_message(user_id, [message], ch["access_token"])
     save_message(
-        user_id, "", "out", "text", text=text,
+        channel_key, user_id, "", "out", "text", text=text,
         sender_user_id=current_user["id"], sender_name=current_user["display_name"],
     )
     return {"status": "sent", "url": link}
@@ -751,6 +960,7 @@ REGISTER_PAGE_HTML = """<!DOCTYPE html>
 
 <script>
   const LIFF_ID = "__LIFF_ID__";
+  const CHANNEL_KEY = "__CHANNEL_KEY__";
   let userId = null;
   const statusEl = document.getElementById('status');
   const form = document.getElementById('reg-form');
@@ -791,6 +1001,7 @@ REGISTER_PAGE_HTML = """<!DOCTYPE html>
     setStatus('กำลังส่งข้อมูล...', '');
 
     const payload = {
+      channel_key: CHANNEL_KEY,
       user_id: userId,
       first_name: document.getElementById('first_name').value.trim(),
       last_name: document.getElementById('last_name').value.trim(),
@@ -827,9 +1038,18 @@ REGISTER_PAGE_HTML = """<!DOCTYPE html>
 """
 
 
+@app.get("/register/{channel_key}", response_class=HTMLResponse)
+def register_page(channel_key: str):
+    ch = get_channel(channel_key)
+    html = REGISTER_PAGE_HTML.replace("__LIFF_ID__", ch["liff_id"]).replace("__CHANNEL_KEY__", channel_key)
+    return HTMLResponse(content=html)
+
+
 @app.get("/register", response_class=HTMLResponse)
-def register_page():
-    return HTMLResponse(content=REGISTER_PAGE_HTML.replace("__LIFF_ID__", LIFF_ID))
+def register_page_default():
+    # Legacy URL — the LIFF app already configured with this Endpoint URL in
+    # the LINE console keeps working unchanged.
+    return register_page(DEFAULT_CHANNEL_KEY)
 
 
 # ---------------------------------------------------------------------------
@@ -1249,38 +1469,41 @@ def admin_page(request: Request):
     return HTMLResponse(content=ADMIN_PAGE_HTML)
 
 
-@app.post("/api/conversations/{user_id}/reply")
-async def reply_to_user(user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+@app.post("/api/{channel_key}/conversations/{user_id}/reply")
+async def reply_to_user(channel_key: str, user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
+    ch = get_channel(channel_key)
     body = await request.json()
     text = (body.get("text") or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
 
-    if not CHANNEL_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="LINE_CHANNEL_ACCESS_TOKEN is not set on the server")
+    if not ch["access_token"]:
+        raise HTTPException(status_code=500, detail="channel has no access_token configured")
 
     message = {"type": "text", "text": text}
     sender = build_sender(current_user, request)
     if sender:
         message["sender"] = sender
-    await push_message(user_id, [message])
+    await push_message(user_id, [message], ch["access_token"])
     save_message(
-        user_id, "", "out", "text", text=text,
+        channel_key, user_id, "", "out", "text", text=text,
         sender_user_id=current_user["id"], sender_name=current_user["display_name"],
     )
     return {"status": "sent"}
 
 
-@app.post("/api/conversations/{user_id}/reply-media")
+@app.post("/api/{channel_key}/conversations/{user_id}/reply-media")
 async def reply_with_media(
     request: Request,
+    channel_key: str,
     user_id: str,
     file: UploadFile = File(...),
     kind: str = Form(...),
     current_user: dict = Depends(get_current_user),
 ):
-    if not CHANNEL_ACCESS_TOKEN:
-        raise HTTPException(status_code=500, detail="LINE_CHANNEL_ACCESS_TOKEN is not set on the server")
+    ch = get_channel(channel_key)
+    if not ch["access_token"]:
+        raise HTTPException(status_code=500, detail="channel has no access_token configured")
 
     data = await file.read()
     if not data:
@@ -1297,9 +1520,9 @@ async def reply_with_media(
         message = {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url}
         if sender:
             message["sender"] = sender
-        await push_message(user_id, [message])
+        await push_message(user_id, [message], ch["access_token"])
         save_message(
-            user_id, "", "out", "image", text=file.filename, media_id=media_id,
+            channel_key, user_id, "", "out", "image", text=file.filename, media_id=media_id,
             sender_user_id=current_user["id"], sender_name=current_user["display_name"],
         )
     else:
@@ -1308,19 +1531,19 @@ async def reply_with_media(
         message = {"type": "text", "text": f"📎 {file.filename}\n{public_url}"}
         if sender:
             message["sender"] = sender
-        await push_message(user_id, [message])
+        await push_message(user_id, [message], ch["access_token"])
         save_message(
-            user_id, "", "out", "file", text=file.filename, media_id=media_id,
+            channel_key, user_id, "", "out", "file", text=file.filename, media_id=media_id,
             sender_user_id=current_user["id"], sender_name=current_user["display_name"],
         )
 
     return {"status": "sent", "url": public_url}
 
 
-async def push_message(user_id: str, messages: list):
+async def push_message(user_id: str, messages: list, access_token: str):
     url = "https://api.line.me/v2/bot/message/push"
     headers = {
-        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
     }
     payload = {"to": user_id, "messages": messages}

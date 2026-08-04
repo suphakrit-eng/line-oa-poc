@@ -14,6 +14,12 @@ services:
         sync: false
       - key: LIFF_ID
         sync: false
+      - key: LINE_CHANNEL_KEY
+        sync: false
+      - key: LINE_CHANNEL_NAME
+        sync: false
+      - key: LINE_CHANNELS_JSON
+        sync: false
       - key: SECRET_KEY
         sync: false
       - key: ADMIN_BOOTSTRAP_USERNAME
