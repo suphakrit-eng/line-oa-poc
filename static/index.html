@@ -554,10 +554,15 @@ async function addNote() {
   loadNotes();
 }
 
+let profileSignature = null;
+
 function renderProfileTabContent() {
   document.getElementById('tab-content').innerHTML = `
     <div id="profile-content"><div class="profile-empty">กำลังโหลด...</div></div>
   `;
+  // Force the next loadProfile() call to actually render, since the box
+  // above was just reset to the loading placeholder.
+  profileSignature = null;
 }
 
 async function loadProfile() {
@@ -566,6 +571,14 @@ async function loadProfile() {
   const p = await res.json();
   const box = document.getElementById('profile-content');
   if (!box) return;
+
+  // The 3s poll calls this repeatedly even while nothing changed, which used
+  // to blank out and re-fetch the cross-OA section every time (visible
+  // flicker). Skip re-rendering entirely when the data is identical to what's
+  // already on screen.
+  const sig = `${currentChannel}|${currentUserId}|${JSON.stringify(p)}`;
+  if (sig === profileSignature) return;
+  profileSignature = sig;
 
   const hasData = p && (p.email || p.first_name || p.last_name || p.phone || p.birthday);
 
