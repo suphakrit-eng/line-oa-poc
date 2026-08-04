@@ -151,6 +151,10 @@ def init_db():
                 """
             )
 
+            # Migration: profile photo used as the LINE "sender.iconUrl" when
+            # this account replies to a customer (see icon-nickname-switch).
+            cur.execute("ALTER TABLE admin_users ADD COLUMN IF NOT EXISTS photo_media_id INTEGER REFERENCES media(id)")
+
             # First-run bootstrap: if there are no accounts at all yet, create
             # one admin account so someone can log in and add the rest.
             cur.execute("SELECT COUNT(*) FROM admin_users")
@@ -253,6 +257,21 @@ def require_admin(user: dict = Depends(get_current_user)) -> dict:
     if user["role"] != "admin":
         raise HTTPException(status_code=403, detail="admin only")
     return user
+
+
+def build_sender(current_user: dict, request: Request) -> dict | None:
+    """Build a LINE `sender` object (see "Customize icon and display name" in
+    the Messaging API docs) so the customer sees which specific account
+    replied, instead of just the LINE Official Account's own name/icon.
+    Only attached if the account has uploaded a profile photo — LINE's
+    sender.iconUrl must be a real reachable https image."""
+    if not current_user.get("photo_media_id"):
+        return None
+    icon_url = str(request.base_url).rstrip("/") + f"/media/{current_user['photo_media_id']}"
+    # LINE limits sender.name length; truncate defensively so a long display
+    # name never causes the whole send to fail.
+    name = (current_user["display_name"] or "")[:20]
+    return {"name": name, "iconUrl": icon_url}
 
 
 # Paths reachable without being logged in. /media/* must stay public because
@@ -652,7 +671,7 @@ async def save_customer_profile(request: Request):
 
 
 @app.post("/api/conversations/{user_id}/send-registration-link")
-async def send_registration_link(user_id: str, current_user: dict = Depends(get_current_user)):
+async def send_registration_link(user_id: str, request: Request, current_user: dict = Depends(get_current_user)):
     if not CHANNEL_ACCESS_TOKEN:
         raise HTTPException(status_code=500, detail="LINE_CHANNEL_ACCESS_TOKEN is not set on the server")
     if not LIFF_ID:
@@ -660,7 +679,11 @@ async def send_registration_link(user_id: str, current_user: dict = Depends(get_
 
     link = f"https://liff.line.me/{LIFF_ID}"
     text = f"รบกวนกรอกข้อมูลติดต่อเพิ่มเติมที่ลิงก์นี้ด้วยนะคะ/ครับ 🙏\n{link}"
-    await push_message(user_id, [{"type": "text", "text": text}])
+    message = {"type": "text", "text": text}
+    sender = build_sender(current_user, request)
+    if sender:
+        message["sender"] = sender
+    await push_message(user_id, [message])
     save_message(
         user_id, "", "out", "text", text=text,
         sender_user_id=current_user["id"], sender_name=current_user["display_name"],
@@ -908,14 +931,41 @@ async def api_logout(request: Request):
 
 
 @app.get("/api/me")
-def api_me(current_user: dict = Depends(get_current_user)):
+def api_me(request: Request, current_user: dict = Depends(get_current_user)):
+    photo_url = None
+    if current_user.get("photo_media_id"):
+        photo_url = str(request.base_url).rstrip("/") + f"/media/{current_user['photo_media_id']}"
     return {
         "id": current_user["id"],
         "username": current_user["username"],
         "display_name": current_user["display_name"],
         "color": current_user["color"],
         "role": current_user["role"],
+        "photo_url": photo_url,
     }
+
+
+@app.post("/api/me/photo")
+async def upload_my_photo(file: UploadFile = File(...), current_user: dict = Depends(get_current_user)):
+    """Self-service profile photo upload. Used as the LINE sender.iconUrl so
+    customers see this account's real photo on messages it sends."""
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="empty file")
+    content_type = file.content_type or "application/octet-stream"
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="ต้องเป็นไฟล์รูปภาพเท่านั้น")
+    media_id = save_media(content_type, file.filename, data)
+    conn = get_pool().getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE admin_users SET photo_media_id = %s WHERE id = %s",
+                (media_id, current_user["id"]),
+            )
+    finally:
+        get_pool().putconn(conn)
+    return {"status": "ok"}
 
 
 @app.post("/api/me/change-password")
@@ -1209,7 +1259,11 @@ async def reply_to_user(user_id: str, request: Request, current_user: dict = Dep
     if not CHANNEL_ACCESS_TOKEN:
         raise HTTPException(status_code=500, detail="LINE_CHANNEL_ACCESS_TOKEN is not set on the server")
 
-    await push_message(user_id, [{"type": "text", "text": text}])
+    message = {"type": "text", "text": text}
+    sender = build_sender(current_user, request)
+    if sender:
+        message["sender"] = sender
+    await push_message(user_id, [message])
     save_message(
         user_id, "", "out", "text", text=text,
         sender_user_id=current_user["id"], sender_name=current_user["display_name"],
@@ -1235,14 +1289,15 @@ async def reply_with_media(
     content_type = file.content_type or "application/octet-stream"
     media_id = save_media(content_type, file.filename, data)
     public_url = str(request.base_url).rstrip("/") + f"/media/{media_id}"
+    sender = build_sender(current_user, request)
 
     if kind == "image":
         if not content_type.startswith("image/"):
             raise HTTPException(status_code=400, detail="ไฟล์นี้ไม่ใช่รูปภาพ")
-        await push_message(
-            user_id,
-            [{"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url}],
-        )
+        message = {"type": "image", "originalContentUrl": public_url, "previewImageUrl": public_url}
+        if sender:
+            message["sender"] = sender
+        await push_message(user_id, [message])
         save_message(
             user_id, "", "out", "image", text=file.filename, media_id=media_id,
             sender_user_id=current_user["id"], sender_name=current_user["display_name"],
@@ -1250,10 +1305,10 @@ async def reply_with_media(
     else:
         # LINE's Messaging API has no generic "send file" message type, so we
         # send a text message containing a link the customer can tap to download.
-        await push_message(
-            user_id,
-            [{"type": "text", "text": f"📎 {file.filename}\n{public_url}"}],
-        )
+        message = {"type": "text", "text": f"📎 {file.filename}\n{public_url}"}
+        if sender:
+            message["sender"] = sender
+        await push_message(user_id, [message])
         save_message(
             user_id, "", "out", "file", text=file.filename, media_id=media_id,
             sender_user_id=current_user["id"], sender_name=current_user["display_name"],
