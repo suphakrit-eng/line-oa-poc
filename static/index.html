@@ -26,6 +26,7 @@
   .conv-item { padding: 12px 16px; cursor: pointer; border-bottom: 1px solid #f0f0f0; position: relative; }
   .conv-item:hover, .conv-item.active { background: #e8f5e9; }
   .conv-item .name { font-weight: 600; font-size: 14px; }
+  .conv-item .name .group-tag { font-weight: 500; font-size: 10px; color: #6b7fd7; background: #e8ebfb; border-radius: 8px; padding: 1px 6px; margin-left: 6px; vertical-align: middle; }
   .conv-item .time { font-size: 11px; color: #888; margin-top: 2px; }
   .assign-badge { display: inline-block; margin-top: 6px; padding: 2px 8px; border-radius: 10px; font-size: 11px; color: #fff; }
   .assign-badge.unassigned { background: #bbb; }
@@ -127,6 +128,7 @@
 <script>
 let currentUserId = null;
 let currentUserName = null;
+let currentChatType = 'user';
 let currentTab = 'chat';
 let currentUser = null;
 let teamRoster = [];
@@ -311,9 +313,10 @@ function renderConversationList() {
     const badge = assigned
       ? `<span class="assign-badge" style="background:${assigned.color}">${escapeHtml(assigned.display_name)}</span>`
       : `<span class="assign-badge unassigned">ยังไม่มอบหมาย</span>`;
+    const groupTag = (c.chat_type === 'group' || c.chat_type === 'room') ? '<span class="group-tag">กลุ่ม</span>' : '';
     return `
-      <div class="conv-item ${c.user_id === currentUserId ? 'active' : ''}" data-user-id="${escapeAttr(c.user_id)}" data-name="${escapeAttr(c.display_name || c.user_id)}">
-        <div class="name">${escapeHtml(c.display_name || c.user_id)}</div>
+      <div class="conv-item ${c.user_id === currentUserId ? 'active' : ''}" data-user-id="${escapeAttr(c.user_id)}" data-name="${escapeAttr(c.display_name || c.user_id)}" data-chat-type="${escapeAttr(c.chat_type || 'user')}">
+        <div class="name">${escapeHtml(c.display_name || c.user_id)}${groupTag}</div>
         <div class="time">${t}</div>
         ${badge}
       </div>
@@ -324,6 +327,8 @@ function renderConversationList() {
 function selectConversation(userId, name) {
   currentUserId = userId;
   currentUserName = name || userId;
+  const conv = allConversations.find(c => c.user_id === userId);
+  currentChatType = (conv && conv.chat_type) || 'user';
   currentTab = 'chat';
   renderChatFrame();
   loadConversations();
@@ -342,6 +347,8 @@ function switchTab(tab) {
 function renderChatFrame() {
   const conv = allConversations.find(c => c.user_id === currentUserId);
   const assignedTo = conv ? conv.assigned_to : null;
+  if (conv) currentChatType = conv.chat_type || 'user';
+  const isGroup = currentChatType === 'group' || currentChatType === 'room';
   const assignOptions = ['<option value="">ยังไม่มอบหมาย</option>']
     .concat(teamRoster.map(s =>
       `<option value="${escapeAttr(s.id)}" ${String(s.id) === String(assignedTo) ? 'selected' : ''}>${escapeHtml(s.display_name)}</option>`
@@ -350,7 +357,7 @@ function renderChatFrame() {
   document.getElementById('chat').innerHTML = `
     <div id="chat-header">
       <button id="back-btn" onclick="goBackToList()">‹</button>
-      <span id="chat-title">${escapeHtml(currentUserName)}</span>
+      <span id="chat-title">${escapeHtml(currentUserName)}${isGroup ? ' (กลุ่ม)' : ''}</span>
       <select id="assign-select">${assignOptions}</select>
     </div>
     <div id="tab-bar">
@@ -438,9 +445,13 @@ function renderNotesTabContent() {
 }
 
 function renderBubble(m) {
-  const sender = (m.direction === 'out' && m.sender_name)
-    ? `<div class="bubble-sender">${escapeHtml(m.sender_name)}</div>`
-    : '';
+  const isGroup = currentChatType === 'group' || currentChatType === 'room';
+  let sender = '';
+  if (m.direction === 'out' && m.sender_name) {
+    sender = `<div class="bubble-sender">${escapeHtml(m.sender_name)}</div>`;
+  } else if (m.direction === 'in' && isGroup && m.display_name) {
+    sender = `<div class="bubble-sender">${escapeHtml(m.display_name)}</div>`;
+  }
   let inner;
   if (m.msg_type === 'image' && m.media_id) {
     inner = `<div class="bubble ${m.direction} media"><img src="/media/${m.media_id}" onclick="window.open('/media/${m.media_id}', '_blank')" /></div>`;

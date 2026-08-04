@@ -180,6 +180,31 @@ def init_db():
             # Migration: which LINE OA / project this message belongs to.
             _ensure_channel_key_column(cur, "messages", DEFAULT_CHANNEL_KEY)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_user ON messages (channel_key, user_id, created_at)")
+
+            # Migration: group/multi-person chat support. `chat_id` is the
+            # conversation grouping key — a LINE user_id for 1:1 chats, or a
+            # groupId/roomId when the OA has been added to a group chat.
+            # `user_id` keeps its original meaning (the specific person tied
+            # to this message; for inbound group messages, the member who
+            # sent it) so per-message sender info isn't lost.
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_id TEXT")
+            cur.execute("ALTER TABLE messages ADD COLUMN IF NOT EXISTS chat_type TEXT NOT NULL DEFAULT 'user'")
+            cur.execute("UPDATE messages SET chat_id = user_id WHERE chat_id IS NULL")
+            cur.execute("ALTER TABLE messages ALTER COLUMN chat_id SET NOT NULL")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_channel_chat ON messages (channel_key, chat_id, created_at)")
+
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS group_meta (
+                    channel_key TEXT NOT NULL,
+                    group_id TEXT NOT NULL,
+                    group_name TEXT,
+                    picture_url TEXT,
+                    updated_at DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY (channel_key, group_id)
+                )
+                """
+            )
             # LINE sometimes redelivers the same webhook event (e.g. if our
             # server was slow to respond, such as waking up from sleep on
             # Render's free tier). This unique index + ON CONFLICT DO NOTHING
@@ -432,6 +457,104 @@ async def fetch_display_name(user_id: str, access_token: str) -> str:
     return user_id
 
 
+async def fetch_group_member_display_name(chat_id: str, user_id: str, access_token: str, chat_type: str) -> str:
+    """Name of a specific member inside a group/multi-person chat — uses the
+    "Get group/room member profile" API, which works even if that member has
+    never added the OA as a 1:1 friend (unlike the regular profile API)."""
+    if not access_token:
+        return user_id
+    kind = "room" if chat_type == "room" else "group"
+    url = f"https://api.line.me/v2/bot/{kind}/{chat_id}/member/{user_id}"
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                return resp.json().get("displayName", user_id)
+    except Exception:
+        pass
+    return await fetch_display_name(user_id, access_token)
+
+
+async def ensure_group_meta(channel_key: str, group_id: str, chat_type: str, access_token: str):
+    """Cache the group/room's own display name (shown as the conversation
+    name in the sidebar) — refetched at most once a day per group."""
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT updated_at FROM group_meta WHERE channel_key = %s AND group_id = %s",
+                (channel_key, group_id),
+            )
+            row = cur.fetchone()
+    finally:
+        get_pool().putconn(conn)
+    if row and time.time() - row[0] < 86400:
+        return
+
+    name, picture = group_id, None
+    if chat_type == "group" and access_token:
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(
+                    f"https://api.line.me/v2/bot/group/{group_id}/summary",
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    name = data.get("groupName", group_id)
+                    picture = data.get("pictureUrl")
+        except Exception:
+            pass
+    # Multi-person "room" chats have no summary/name in the Messaging API.
+
+    conn = get_pool().getconn()
+    try:
+        with conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO group_meta (channel_key, group_id, group_name, picture_url, updated_at)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT (channel_key, group_id) DO UPDATE SET
+                    group_name = EXCLUDED.group_name, picture_url = EXCLUDED.picture_url, updated_at = EXCLUDED.updated_at
+                """,
+                (channel_key, group_id, name, picture, time.time()),
+            )
+    finally:
+        get_pool().putconn(conn)
+
+
+def get_group_name(channel_key: str, group_id: str) -> str | None:
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT group_name FROM group_meta WHERE channel_key = %s AND group_id = %s",
+                (channel_key, group_id),
+            )
+            row = cur.fetchone()
+            return row["group_name"] if row else None
+    finally:
+        get_pool().putconn(conn)
+
+
+def get_chat_type(channel_key: str, chat_id: str) -> str:
+    """Best-known chat_type for an existing conversation, used when replying
+    (so an outbound message is correctly recorded as belonging to a group vs
+    a 1:1 chat). Defaults to 'user' for a brand-new chat_id."""
+    conn = get_pool().getconn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT chat_type FROM messages WHERE channel_key = %s AND chat_id = %s ORDER BY created_at DESC LIMIT 1",
+                (channel_key, chat_id),
+            )
+            row = cur.fetchone()
+            return row[0] if row else "user"
+    finally:
+        get_pool().putconn(conn)
+
+
 async def download_line_content(message_id: str, access_token: str) -> tuple[bytes, str]:
     """Download image/video/audio/file content sent by a user via the
     LINE Content API. Returns (bytes, content_type)."""
@@ -478,18 +601,20 @@ def save_message(
     line_message_id: str | None = None,
     sender_user_id: int | None = None,
     sender_name: str | None = None,
+    chat_id: str | None = None,
+    chat_type: str = "user",
 ):
     conn = get_pool().getconn()
     try:
         with conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO messages (channel_key, user_id, display_name, direction, msg_type, text, media_id, created_at, line_message_id, sender_user_id, sender_name)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                INSERT INTO messages (channel_key, chat_id, chat_type, user_id, display_name, direction, msg_type, text, media_id, created_at, line_message_id, sender_user_id, sender_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (line_message_id) WHERE line_message_id IS NOT NULL DO NOTHING
                 """,
                 (
-                    channel_key, user_id, display_name, direction, msg_type, text, media_id,
+                    channel_key, chat_id or user_id, chat_type, user_id, display_name, direction, msg_type, text, media_id,
                     time.time(), line_message_id, sender_user_id, sender_name,
                 ),
             )
@@ -554,8 +679,22 @@ async def _handle_webhook(channel_key: str, request: Request):
 
         message = event.get("message", {})
         msg_type = message.get("type")
-        user_id = event["source"]["userId"]
+        source = event.get("source", {})
+        source_type = source.get("type", "user")
+        sender_user_id = source.get("userId")
         line_message_id = message.get("id")
+
+        if source_type == "group":
+            chat_id, chat_type = source.get("groupId"), "group"
+        elif source_type == "room":
+            chat_id, chat_type = source.get("roomId"), "room"
+        else:
+            chat_id, chat_type = sender_user_id, "user"
+
+        if not chat_id:
+            # Shouldn't happen per LINE's docs, but skip rather than crash if
+            # a future event shape ever omits the id.
+            continue
 
         # LINE may redeliver the same webhook event (e.g. our server was slow
         # to wake up from Render's free-tier sleep and LINE timed out waiting
@@ -563,12 +702,21 @@ async def _handle_webhook(channel_key: str, request: Request):
         if line_message_id and is_duplicate_line_message(line_message_id):
             continue
 
-        display_name = await fetch_display_name(user_id, ch["access_token"])
+        if chat_type in ("group", "room"):
+            await ensure_group_meta(channel_key, chat_id, chat_type, ch["access_token"])
+            display_name = (
+                await fetch_group_member_display_name(chat_id, sender_user_id, ch["access_token"], chat_type)
+                if sender_user_id else "สมาชิกกลุ่ม"
+            )
+        else:
+            display_name = await fetch_display_name(chat_id, ch["access_token"])
+
+        save_kwargs = dict(chat_id=chat_id, chat_type=chat_type)
 
         if msg_type == "text":
             save_message(
-                channel_key, user_id, display_name, "in", "text",
-                text=message.get("text", ""), line_message_id=line_message_id,
+                channel_key, sender_user_id or chat_id, display_name, "in", "text",
+                text=message.get("text", ""), line_message_id=line_message_id, **save_kwargs,
             )
 
         elif msg_type in ("image", "file", "video", "audio"):
@@ -576,9 +724,9 @@ async def _handle_webhook(channel_key: str, request: Request):
                 data, content_type = await download_line_content(message["id"], ch["access_token"])
             except Exception:
                 save_message(
-                    channel_key, user_id, display_name, "in", "text",
+                    channel_key, sender_user_id or chat_id, display_name, "in", "text",
                     text=f"[ไม่สามารถดาวน์โหลด {msg_type} จากลูกค้าได้]",
-                    line_message_id=line_message_id,
+                    line_message_id=line_message_id, **save_kwargs,
                 )
                 continue
 
@@ -589,15 +737,15 @@ async def _handle_webhook(channel_key: str, request: Request):
                 filename = f"{msg_type}.{ext}"
             media_id = save_media(content_type, filename, data)
             save_message(
-                channel_key, user_id, display_name, "in", stored_type,
-                text=filename, media_id=media_id, line_message_id=line_message_id,
+                channel_key, sender_user_id or chat_id, display_name, "in", stored_type,
+                text=filename, media_id=media_id, line_message_id=line_message_id, **save_kwargs,
             )
 
         else:
             save_message(
-                channel_key, user_id, display_name, "in", "text",
+                channel_key, sender_user_id or chat_id, display_name, "in", "text",
                 text=f"[ลูกค้าส่ง {msg_type} มา — ยังไม่รองรับการแสดงผลประเภทนี้]",
-                line_message_id=line_message_id,
+                line_message_id=line_message_id, **save_kwargs,
             )
 
     return JSONResponse({"status": "ok"})
@@ -623,11 +771,11 @@ def list_conversations(channel_key: str, current_user: dict = Depends(get_curren
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT m.user_id, MAX(m.created_at) as last_at, cm.assigned_to
+                SELECT m.chat_id, m.chat_type, MAX(m.created_at) as last_at, cm.assigned_to
                 FROM messages m
-                LEFT JOIN conversation_meta cm ON cm.user_id = m.user_id AND cm.channel_key = m.channel_key
+                LEFT JOIN conversation_meta cm ON cm.user_id = m.chat_id AND cm.channel_key = m.channel_key
                 WHERE m.channel_key = %s
-                GROUP BY m.user_id, cm.assigned_to
+                GROUP BY m.chat_id, m.chat_type, cm.assigned_to
                 ORDER BY last_at DESC
                 """,
                 (channel_key,),
@@ -638,10 +786,16 @@ def list_conversations(channel_key: str, current_user: dict = Depends(get_curren
 
     result = []
     for r in rows:
+        chat_type = r["chat_type"] or "user"
+        if chat_type in ("group", "room"):
+            display_name = get_group_name(channel_key, r["chat_id"]) or r["chat_id"]
+        else:
+            display_name = get_known_display_name(channel_key, r["chat_id"])
         result.append(
             {
-                "user_id": r["user_id"],
-                "display_name": get_known_display_name(channel_key, r["user_id"]),
+                "user_id": r["chat_id"],
+                "chat_type": chat_type,
+                "display_name": display_name,
                 "last_at": r["last_at"],
                 "assigned_to": r["assigned_to"],
             }
@@ -678,8 +832,8 @@ def get_messages(channel_key: str, user_id: str, current_user: dict = Depends(ge
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
                 """
-                SELECT direction, msg_type, text, media_id, created_at, sender_name
-                FROM messages WHERE channel_key = %s AND user_id = %s ORDER BY created_at ASC
+                SELECT direction, msg_type, text, media_id, created_at, sender_name, display_name
+                FROM messages WHERE channel_key = %s AND chat_id = %s ORDER BY created_at ASC
                 """,
                 (channel_key, user_id),
             )
@@ -896,6 +1050,7 @@ async def send_registration_link(channel_key: str, user_id: str, request: Reques
     save_message(
         channel_key, user_id, "", "out", "text", text=text,
         sender_user_id=current_user["id"], sender_name=current_user["display_name"],
+        chat_id=user_id, chat_type=get_chat_type(channel_key, user_id),
     )
     return {"status": "sent", "url": link}
 
@@ -1488,6 +1643,7 @@ async def reply_to_user(channel_key: str, user_id: str, request: Request, curren
     save_message(
         channel_key, user_id, "", "out", "text", text=text,
         sender_user_id=current_user["id"], sender_name=current_user["display_name"],
+        chat_id=user_id, chat_type=get_chat_type(channel_key, user_id),
     )
     return {"status": "sent"}
 
@@ -1513,6 +1669,7 @@ async def reply_with_media(
     media_id = save_media(content_type, file.filename, data)
     public_url = str(request.base_url).rstrip("/") + f"/media/{media_id}"
     sender = build_sender(current_user, request)
+    chat_type = get_chat_type(channel_key, user_id)
 
     if kind == "image":
         if not content_type.startswith("image/"):
@@ -1524,6 +1681,7 @@ async def reply_with_media(
         save_message(
             channel_key, user_id, "", "out", "image", text=file.filename, media_id=media_id,
             sender_user_id=current_user["id"], sender_name=current_user["display_name"],
+            chat_id=user_id, chat_type=chat_type,
         )
     else:
         # LINE's Messaging API has no generic "send file" message type, so we
@@ -1535,6 +1693,7 @@ async def reply_with_media(
         save_message(
             channel_key, user_id, "", "out", "file", text=file.filename, media_id=media_id,
             sender_user_id=current_user["id"], sender_name=current_user["display_name"],
+            chat_id=user_id, chat_type=chat_type,
         )
 
     return {"status": "sent", "url": public_url}
